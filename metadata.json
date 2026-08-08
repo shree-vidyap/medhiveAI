@@ -1,0 +1,6 @@
+{
+  "name": "MediHivi AI",
+  "description": "Multi-Agent Healthcare Triage, Smart Referral & Emergency Assistance Platform",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

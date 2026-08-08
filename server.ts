@@ -1,0 +1,358 @@
+import express from 'express';
+import path from 'path';
+import { createServer as createViteServer } from 'vite';
+import {
+  INITIAL_FACILITIES,
+  INITIAL_MOBILE_CLINICS,
+  INITIAL_SCHEMES,
+  SAMPLE_PATIENTS,
+  SAMPLE_QUEUE,
+  SAMPLE_REFERRALS,
+  SAMPLE_TRANSPORTS,
+} from './src/data/mockDatabase';
+import {
+  calculateQueuePriority,
+  runChatbot,
+  runReferralAgent,
+  runReportAgent,
+  runTriageAgent,
+} from './server/gemini';
+
+// In-memory data state
+let patients = [...SAMPLE_PATIENTS];
+let facilities = [...INITIAL_FACILITIES];
+let queue = [...SAMPLE_QUEUE];
+let referrals = [...SAMPLE_REFERRALS];
+let transports = [...SAMPLE_TRANSPORTS];
+let schemes = [...INITIAL_SCHEMES];
+let mobileClinics = [...INITIAL_MOBILE_CLINICS];
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(express.json({ limit: '10mb' }));
+
+  // --- API ROUTES ---
+
+  // Health check
+  app.get('/api/v1/health', (req, res) => {
+    res.json({ status: 'ok', app: 'RuralCare AI', timestamp: new Date().toISOString() });
+  });
+
+  // Auth mock
+  app.post('/api/v1/auth/login', (req, res) => {
+    const { role = 'PATIENT', username = 'user' } = req.body;
+    res.json({
+      token: 'jwt-token-ruralcare-2026',
+      user: {
+        id: 'usr-100',
+        name: username,
+        role,
+        district: 'Mandya',
+      },
+    });
+  });
+
+  // Patient registration & list
+  app.get('/api/v1/patients', (req, res) => {
+    res.json(patients);
+  });
+
+  app.get('/api/v1/patients/:id', (req, res) => {
+    const p = patients.find((item) => item.id === req.params.id);
+    if (!p) return res.status(404).json({ error: 'Patient not found' });
+    res.json(p);
+  });
+
+  app.post('/api/v1/patients', (req, res) => {
+    const newPatient = {
+      id: `RC-2026-${String(patients.length + 104).padStart(6, '0')}`,
+      createdAt: new Date().toISOString(),
+      ...req.body,
+    };
+    patients.unshift(newPatient);
+    res.status(201).json(newPatient);
+  });
+
+  // AI Triage API (Invokes Agent 1, Agent 2 & Agent 3)
+  app.post('/api/v1/triage/predict', async (req, res) => {
+    try {
+      const { symptomsText, vitals, patientAge, gender, patientId, patientName } = req.body;
+
+      // Agent 1: Triage
+      const triageResult = await runTriageAgent({
+        symptomsText,
+        vitals,
+        patientAge,
+        gender,
+      });
+
+      // Agent 2: Smart Referral
+      const referralRecommendation = await runReferralAgent({
+        triageLevel: triageResult.level,
+        symptoms: [symptomsText],
+        facilities,
+      });
+
+      // Agent 3: Patient Priority Queue Addition
+      const newQueueItem = {
+        id: `q-${Date.now()}`,
+        patientId: patientId || `RC-2026-GUEST`,
+        patientName: patientName || 'Patient',
+        age: patientAge || 45,
+        gender: gender || 'unknown',
+        symptoms: [symptomsText],
+        triageLevel: triageResult.level,
+        waitingTimeMins: 0,
+        priorityScore: 50,
+        status: 'WAITING' as const,
+        registeredAt: new Date().toISOString(),
+      };
+
+      queue.unshift(newQueueItem);
+      queue = calculateQueuePriority(queue);
+
+      res.json({
+        triage: triageResult,
+        referral: referralRecommendation,
+        queueItem: newQueueItem,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Triage prediction failed' });
+    }
+  });
+
+  // Medical Report OCR & Document AI Agent (Agent 4)
+  app.post('/api/v1/triage/report', async (req, res) => {
+    try {
+      const { fileData, fileType } = req.body;
+      const extraction = await runReportAgent(fileData, fileType || 'image/png');
+
+      // Also trigger triage based on extracted findings
+      const triageResult = await runTriageAgent({
+        symptomsText: extraction.summary + ' ' + extraction.keyFindings.join(', '),
+      });
+
+      res.json({
+        extraction,
+        triage: triageResult,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Report processing failed' });
+    }
+  });
+
+  // Healthcare Facilities API
+  app.get('/api/v1/facilities/nearby', (req, res) => {
+    res.json(facilities);
+  });
+
+  app.patch('/api/v1/facilities/:id', (req, res) => {
+    const index = facilities.findIndex((f) => f.id === req.params.id);
+    if (index === -1) return res.status(404).json({ error: 'Facility not found' });
+    facilities[index] = { ...facilities[index], ...req.body };
+    res.json(facilities[index]);
+  });
+
+  // Referral Management API
+  app.get('/api/v1/referrals', (req, res) => {
+    res.json(referrals);
+  });
+
+  app.post('/api/v1/referrals', (req, res) => {
+    const newRef = {
+      id: `REF-2026-${String(referrals.length + 90).padStart(4, '0')}`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      status: 'SENT' as const,
+      history: [
+        {
+          status: 'SENT' as const,
+          timestamp: new Date().toISOString(),
+          note: 'Referral generated by RuralCare AI Triage',
+        },
+      ],
+      ...req.body,
+    };
+    referrals.unshift(newRef);
+
+    // If emergency RED, also create emergency transport request automatically
+    if (newRef.triageLevel === 'RED') {
+      const newTransport = {
+        id: `TRP-108-${Math.floor(1000 + Math.random() * 9000)}`,
+        referralId: newRef.id,
+        patientName: newRef.patientName,
+        pickupLocation: `${newRef.referringFacility} PHC`,
+        destinationFacility: newRef.targetFacilityName,
+        vehicleType: '108 Emergency' as const,
+        status: 'ASSIGNED' as const,
+        etaMins: 10,
+        driverPhone: '+91-98000-10808 (Emergency 108 Dispatch)',
+        vehicleNumber: `KA-11-G-${Math.floor(1000 + Math.random() * 9000)}`,
+        requestedAt: new Date().toISOString(),
+      };
+      transports.unshift(newTransport);
+    }
+
+    res.status(201).json(newRef);
+  });
+
+  app.patch('/api/v1/referrals/:id/status', (req, res) => {
+    const { status, note } = req.body;
+    const refIndex = referrals.findIndex((r) => r.id === req.params.id);
+    if (refIndex === -1) return res.status(404).json({ error: 'Referral not found' });
+
+    referrals[refIndex].status = status;
+    referrals[refIndex].updatedAt = new Date().toISOString();
+    referrals[refIndex].history.push({
+      status,
+      timestamp: new Date().toISOString(),
+      note: note || `Status updated to ${status}`,
+    });
+
+    res.json(referrals[refIndex]);
+  });
+
+  // Patient Queue API
+  app.get('/api/v1/queue', (req, res) => {
+    queue = calculateQueuePriority(queue);
+    res.json(queue);
+  });
+
+  app.patch('/api/v1/queue/:id', (req, res) => {
+    const qIndex = queue.findIndex((item) => item.id === req.params.id);
+    if (qIndex === -1) return res.status(404).json({ error: 'Queue item not found' });
+
+    queue[qIndex] = { ...queue[qIndex], ...req.body };
+    res.json(queue[qIndex]);
+  });
+
+  // Emergency Transport Assistance
+  app.get('/api/v1/transport', (req, res) => {
+    res.json(transports);
+  });
+
+  app.post('/api/v1/transport/request', (req, res) => {
+    const newTransport = {
+      id: `TRP-108-${Math.floor(1000 + Math.random() * 9000)}`,
+      status: 'ASSIGNED' as const,
+      etaMins: 12,
+      driverPhone: '+91-98000-10808 (Driver: Shivanna)',
+      vehicleNumber: 'KA-11-G-0108',
+      requestedAt: new Date().toISOString(),
+      ...req.body,
+    };
+    transports.unshift(newTransport);
+    res.status(201).json(newTransport);
+  });
+
+  // Government Schemes & Eligibility Agent (Agent 5)
+  app.get('/api/v1/schemes', (req, res) => {
+    res.json(schemes);
+  });
+
+  app.post('/api/v1/schemes/check-eligibility', (req, res) => {
+    const { age, incomeCategory, state, hasBplCard } = req.body;
+
+    const evaluated = schemes.map((sch) => {
+      let status = 'POSSIBLY_ELIGIBLE';
+      if (hasBplCard && (sch.id === 'scheme-01' || sch.id === 'scheme-02')) {
+        status = 'ELIGIBLE';
+      } else if (sch.id === 'scheme-03') {
+        status = 'ELIGIBLE'; // Jan Aushadhi open to all
+      } else if (sch.id === 'scheme-04' && req.body.isPregnant) {
+        status = 'ELIGIBLE';
+      }
+      return {
+        ...sch,
+        userEligibilityStatus: status,
+      };
+    });
+
+    res.json(evaluated);
+  });
+
+  // Mobile Clinics
+  app.get('/api/v1/mobile-clinics/nearby', (req, res) => {
+    res.json(mobileClinics);
+  });
+
+  // RuralCare Assistant Chatbot
+  app.post('/api/v1/chat', async (req, res) => {
+    try {
+      const { message, history, language } = req.body;
+      const botResponse = await runChatbot(message, history, language);
+      res.json(botResponse);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Chatbot failure' });
+    }
+  });
+
+  // Analytics Dashboard
+  app.get('/api/v1/dashboard/analytics', (req, res) => {
+    const totalPatients = queue.length + 15;
+    const emergencyCases = queue.filter((q) => q.triageLevel === 'RED').length + 4;
+    const urgentCases = queue.filter((q) => q.triageLevel === 'ORANGE').length + 6;
+    const pendingReferrals = referrals.filter((r) => r.status === 'SENT' || r.status === 'IN_TRANSIT').length;
+    const totalBeds = facilities.reduce((sum, f) => sum + f.beds.available, 0);
+
+    res.json({
+      totalPatientsToday: totalPatients,
+      emergencyCases,
+      urgentCases,
+      pendingReferrals,
+      totalAvailableBeds: totalBeds,
+      triageBreakdown: {
+        RED: emergencyCases,
+        ORANGE: urgentCases,
+        YELLOW: 8,
+        GREEN: 12,
+      },
+      averageWaitingTimeMins: 18,
+    });
+  });
+
+  // Sync endpoint for offline queue sync
+  app.post('/api/v1/sync', (req, res) => {
+    const { offlineQueue = [], offlinePatients = [], offlineReferrals = [] } = req.body;
+
+    if (offlinePatients.length) {
+      patients.unshift(...offlinePatients);
+    }
+    if (offlineQueue.length) {
+      queue.unshift(...offlineQueue);
+      queue = calculateQueuePriority(queue);
+    }
+    if (offlineReferrals.length) {
+      referrals.unshift(...offlineReferrals);
+    }
+
+    res.json({
+      syncedCount: offlinePatients.length + offlineQueue.length + offlineReferrals.length,
+      status: 'SUCCESS',
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  // Vite Middleware in dev mode
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[MediHivi AI] Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
